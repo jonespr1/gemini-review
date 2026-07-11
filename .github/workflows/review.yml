@@ -28,6 +28,20 @@ jobs:
         with:
           persist-credentials: 'false'
 
+      # The /pr-code-review command needs the repo + PR number as context. Without
+      # this file the CLI runs but silently posts nothing (run-gemini-cli issue #265).
+      - name: 'Prepare prompt context'
+        shell: 'bash'
+        env:
+          REPOSITORY: '${{ github.repository }}'
+          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+        run: |-
+          mkdir -p .gemini
+          jq -n \
+            --arg repo "${REPOSITORY}" \
+            --arg pr "${PULL_REQUEST_NUMBER}" \
+            '{repository: $repo, pull_request_number: $pr}' > .gemini/context.json
+
       - name: 'Run Gemini pull request review'
         uses: 'google-github-actions/run-gemini-cli@v0'
         env:
