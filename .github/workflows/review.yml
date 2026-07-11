@@ -17,12 +17,14 @@
 # DUAL REVIEW: set repo Variable AI_DUAL=true, or comment `@gemini-cli /review-both`
 # on a PR, to run BOTH models and post both reviews (broader coverage for critical PRs).
 #
-# PRIVACY + COST + REDUNDANCY: OpenRouter requests use criteria-based routing
-#   {zdr:true, data_collection:"deny", sort:"price", allow_fallbacks:true}
-# = only zero-data-retention, non-training hosts, cheapest first, with automatic failover
-# (no single-host dependency; fails closed if no compliant host). Optional overrides:
-#   AI_OR_PROVIDERS = "novita,fireworks"  (restrict to an allow-list, still load-balanced)
-#   AI_OR_MAXPRICE  = "2,6"               (hard $/1M input,output ceiling)
+# PRIVACY + QUALITY + REDUNDANCY: OpenRouter requests use criteria-based routing
+#   {only:<allow-list>, data_collection:"deny", sort:"throughput", allow_fallbacks:true}
+# = trusted (non-Chinese) hosts only, no training on your data, FASTEST host first (never
+# a slow host just because it is cheap), with automatic failover. Uptime/error avoidance is
+# built into OpenRouter. Jurisdiction is guaranteed by the allow-list, NOT by zdr. Overrides:
+#   AI_OR_PROVIDERS = "novita,fireworks"  (the allow-list; set by the bootstrap script)
+#   AI_OR_SORT      = throughput|latency|price   (default throughput)
+#   AI_OR_MAXPRICE  = "2,6"               (optional hard $/1M input,output ceiling)
 name: 'AI PR Review (reusable)'
 
 on:
@@ -66,6 +68,7 @@ jobs:
           AI_DUAL: '${{ vars.AI_DUAL }}'
           AI_OR_PROVIDERS: '${{ vars.AI_OR_PROVIDERS }}'   # optional: restrict to these OpenRouter host slugs (e.g. "novita,fireworks,together") — still load-balanced with fallback
           AI_OR_MAXPRICE: '${{ vars.AI_OR_MAXPRICE }}'     # optional hard ceiling in $/1M "input,output" (e.g. "2,6") to exclude pricey hosts
+          AI_OR_SORT: '${{ vars.AI_OR_SORT }}'             # provider selection: throughput (default, fastest) | latency | price
           COMMENT_BODY: '${{ github.event.comment.body }}'
           REPO: '${{ github.repository }}'
           PR_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -159,14 +162,16 @@ jobs:
             printf '%s' "$text"
           }
           call_openai() {
-            local req resp text err prov base
-            # Criteria-based routing (no single-host pin): no-training + cheapest-first + failover.
+            local req resp text err prov base sort
+            # Criteria-based routing (no single-host pin): no-training + quality-sorted + failover.
+            # Default sort = throughput so a slow host is never chosen just for being cheap.
+            sort="${AI_OR_SORT:-throughput}"
             if [ -n "${AI_OR_PROVIDERS:-}" ]; then
               # Restrict to an allow-list of trusted hosts, but still load-balance/fail over among them.
-              base="$(jq -n --arg list "$AI_OR_PROVIDERS" '{only:($list|split(",")|map(gsub("^ +| +$";""))), data_collection:"deny", sort:"price", allow_fallbacks:true}')"
+              base="$(jq -n --arg list "$AI_OR_PROVIDERS" --arg s "$sort" '{only:($list|split(",")|map(gsub("^ +| +$";""))), data_collection:"deny", sort:$s, allow_fallbacks:true}')"
             else
-              # Default: any zero-data-retention, non-training host, cheapest first (fails closed if none).
-              base="$(jq -n '{zdr:true, data_collection:"deny", sort:"price", allow_fallbacks:true}')"
+              # No allow-list: any zero-data-retention, non-training host (fails closed if none).
+              base="$(jq -n --arg s "$sort" '{zdr:true, data_collection:"deny", sort:$s, allow_fallbacks:true}')"
             fi
             # Optional hard price ceiling ($/1M "input,output"), e.g. AI_OR_MAXPRICE="2,6".
             if [ -n "${AI_OR_MAXPRICE:-}" ]; then
