@@ -18,13 +18,14 @@
 # on a PR, to run BOTH models and post both reviews (broader coverage for critical PRs).
 #
 # PRIVACY + QUALITY + REDUNDANCY: OpenRouter requests use criteria-based routing
-#   {only:<allow-list>, data_collection:"deny", sort:"throughput", allow_fallbacks:true}
-# = trusted (non-Chinese) hosts only, no training on your data, FASTEST host first (never
-# a slow host just because it is cheap), with automatic failover. Uptime/error avoidance is
-# built into OpenRouter. Jurisdiction is guaranteed by the allow-list, NOT by zdr. Overrides:
-#   AI_OR_PROVIDERS = "novita,fireworks"  (the allow-list; set by the bootstrap script)
-#   AI_OR_SORT      = throughput|latency|price   (default throughput)
-#   AI_OR_MAXPRICE  = "2,6"               (optional hard $/1M input,output ceiling)
+#   {only:<allow-list>, data_collection:"deny", sort:"price", allow_fallbacks:true}
+# The allow-list IS the quality bar: curated to reputable, NON-CHINESE, fp8/full-precision
+# hosts (no lossy fp4). Among those, sort:price picks the cheapest (Novita) with automatic
+# failover; OpenRouter also auto-skips hosts with recent errors/downtime. Jurisdiction is
+# guaranteed by the allow-list, NOT by zdr. Overrides (repo Variables):
+#   AI_OR_PROVIDERS = "novita,fireworks,..."     (the allow-list; set by the bootstrap script)
+#   AI_OR_SORT      = price|throughput|latency    (default price)
+#   AI_OR_MAXPRICE  = "2,6"                        (optional hard $/1M input,output ceiling)
 name: 'AI PR Review (reusable)'
 
 on:
@@ -163,9 +164,9 @@ jobs:
           }
           call_openai() {
             local req resp text err prov base sort
-            # Criteria-based routing (no single-host pin): no-training + quality-sorted + failover.
-            # Default sort = throughput so a slow host is never chosen just for being cheap.
-            sort="${AI_OR_SORT:-throughput}"
+            # Criteria-based routing: the allow-list IS the quality bar (curated to reputable,
+            # non-Chinese, fp8/full-precision hosts — no lossy fp4). Among those, pick cheapest.
+            sort="${AI_OR_SORT:-price}"
             if [ -n "${AI_OR_PROVIDERS:-}" ]; then
               # Restrict to an allow-list of trusted hosts, but still load-balance/fail over among them.
               base="$(jq -n --arg list "$AI_OR_PROVIDERS" --arg s "$sort" '{only:($list|split(",")|map(gsub("^ +| +$";""))), data_collection:"deny", sort:$s, allow_fallbacks:true}')"
