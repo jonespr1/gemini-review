@@ -17,8 +17,12 @@
 # DUAL REVIEW: set repo Variable AI_DUAL=true, or comment `@gemini-cli /review-both`
 # on a PR, to run BOTH models and post both reviews (broader coverage for critical PRs).
 #
-# PRIVACY: OpenRouter requests pin `{"zdr": true, "data_collection": "deny"}` so GLM runs
-# only on zero-data-retention, non-training hosts (fails closed if none are available).
+# PRIVACY + COST + REDUNDANCY: OpenRouter requests use criteria-based routing
+#   {zdr:true, data_collection:"deny", sort:"price", allow_fallbacks:true}
+# = only zero-data-retention, non-training hosts, cheapest first, with automatic failover
+# (no single-host dependency; fails closed if no compliant host). Optional overrides:
+#   AI_OR_PROVIDERS = "novita,fireworks"  (restrict to an allow-list, still load-balanced)
+#   AI_OR_MAXPRICE  = "2,6"               (hard $/1M input,output ceiling)
 name: 'AI PR Review (reusable)'
 
 on:
@@ -60,7 +64,8 @@ jobs:
           GEMINI_MODEL: '${{ vars.GEMINI_MODEL }}'
           AI_BASE_URL: '${{ vars.AI_BASE_URL }}'
           AI_DUAL: '${{ vars.AI_DUAL }}'
-          AI_OR_PROVIDERS: '${{ vars.AI_OR_PROVIDERS }}'   # optional: comma-separated OpenRouter host slugs to pin (e.g. "novita" or "fireworks,together")
+          AI_OR_PROVIDERS: '${{ vars.AI_OR_PROVIDERS }}'   # optional: restrict to these OpenRouter host slugs (e.g. "novita,fireworks,together") — still load-balanced with fallback
+          AI_OR_MAXPRICE: '${{ vars.AI_OR_MAXPRICE }}'     # optional hard ceiling in $/1M "input,output" (e.g. "2,6") to exclude pricey hosts
           COMMENT_BODY: '${{ github.event.comment.body }}'
           REPO: '${{ github.repository }}'
           PR_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -154,13 +159,20 @@ jobs:
             printf '%s' "$text"
           }
           call_openai() {
-            local req resp text err prov
+            local req resp text err prov base
+            # Criteria-based routing (no single-host pin): no-training + cheapest-first + failover.
             if [ -n "${AI_OR_PROVIDERS:-}" ]; then
-              # Pin to specific host(s); no fallback to anything else.
-              prov="$(jq -n --arg list "$AI_OR_PROVIDERS" '{only:($list|split(",")|map(gsub("^ +| +$";""))), allow_fallbacks:false, data_collection:"deny"}')"
+              # Restrict to an allow-list of trusted hosts, but still load-balance/fail over among them.
+              base="$(jq -n --arg list "$AI_OR_PROVIDERS" '{only:($list|split(",")|map(gsub("^ +| +$";""))), data_collection:"deny", sort:"price", allow_fallbacks:true}')"
             else
-              # Default: any zero-data-retention, non-training host (fails closed).
-              prov='{"zdr":true,"data_collection":"deny"}'
+              # Default: any zero-data-retention, non-training host, cheapest first (fails closed if none).
+              base="$(jq -n '{zdr:true, data_collection:"deny", sort:"price", allow_fallbacks:true}')"
+            fi
+            # Optional hard price ceiling ($/1M "input,output"), e.g. AI_OR_MAXPRICE="2,6".
+            if [ -n "${AI_OR_MAXPRICE:-}" ]; then
+              prov="$(printf '%s' "$base" | jq --arg mp "$AI_OR_MAXPRICE" '. + ($mp|split(",")|{max_price:{prompt:(.[0]|tonumber), completion:(.[1]|tonumber)}})')"
+            else
+              prov="$base"
             fi
             req="$(jq -n --arg m "$OMODEL" --arg p "$PROMPT" --argjson prov "$prov" '{model:$m, messages:[{role:"user", content:$p}], provider:$prov}')"
             resp="$(curl -sS -m 180 "${OBASE%/}/chat/completions" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H 'Content-Type: application/json' -H 'HTTP-Referer: https://github.com' -H 'X-Title: PR Review' -d "$req" || true)"
