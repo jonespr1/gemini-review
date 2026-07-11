@@ -55,7 +55,9 @@ jobs:
           # the GitHub MCP server -> post review). Flash (the router forces gemini-3.5-flash)
           # narrates its plan but never emits the tool calls, so nothing gets posted.
           # Pro models reliably execute the multi-step tool calls. ~20-30c per review.
-          gemini_model: 'gemini-3.1-pro'
+          # 'gemini-pro-latest' is an alias to the current Pro model, so it won't 404
+          # when a specific version retires (as gemini-2.5-pro did for new users).
+          gemini_model: 'gemini-pro-latest'
           github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
           settings: |-
             {
