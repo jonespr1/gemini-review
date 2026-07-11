@@ -50,6 +50,7 @@ jobs:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_debug: 'true'   # TEMP: verbose logs to diagnose no-review-posted
           # To pin a model for ALL repos, uncomment and set one value, e.g.
           #   gemini_model: 'gemini-2.5-pro'   # strongest reviews
           #   gemini_model: 'gemini-2.5-flash' # lighter, conserves free quota
