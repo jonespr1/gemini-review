@@ -51,10 +51,11 @@ jobs:
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_debug: 'true'   # TEMP: verbose logs while we confirm reviews post
-          # Pin the model. If left to auto-routing the CLI may pick gemini-3.5-flash,
-          # whose free-tier daily limit is only ~20 requests and gets exhausted fast.
-          # gemini-2.5-flash has a much larger free-tier quota and is a separate bucket.
-          gemini_model: 'gemini-2.5-flash'
+          # Use a Pro model: this review flow is agentic (activate skill -> read PR via
+          # the GitHub MCP server -> post review). Flash (the router forces gemini-3.5-flash)
+          # narrates its plan but never emits the tool calls, so nothing gets posted.
+          # Pro models reliably execute the multi-step tool calls. ~20-30c per review.
+          gemini_model: 'gemini-2.5-pro'
           github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
           settings: |-
             {
