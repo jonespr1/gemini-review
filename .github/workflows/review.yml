@@ -60,6 +60,7 @@ jobs:
           GEMINI_MODEL: '${{ vars.GEMINI_MODEL }}'
           AI_BASE_URL: '${{ vars.AI_BASE_URL }}'
           AI_DUAL: '${{ vars.AI_DUAL }}'
+          AI_OR_PROVIDERS: '${{ vars.AI_OR_PROVIDERS }}'   # optional: comma-separated OpenRouter host slugs to pin (e.g. "novita" or "fireworks,together")
           COMMENT_BODY: '${{ github.event.comment.body }}'
           REPO: '${{ github.repository }}'
           PR_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -153,8 +154,15 @@ jobs:
             printf '%s' "$text"
           }
           call_openai() {
-            local req resp text err
-            req="$(jq -n --arg m "$OMODEL" --arg p "$PROMPT" '{model:$m, messages:[{role:"user", content:$p}], provider:{zdr:true, data_collection:"deny"}}')"
+            local req resp text err prov
+            if [ -n "${AI_OR_PROVIDERS:-}" ]; then
+              # Pin to specific host(s); no fallback to anything else.
+              prov="$(jq -n --arg list "$AI_OR_PROVIDERS" '{only:($list|split(",")|map(gsub("^ +| +$";""))), allow_fallbacks:false, data_collection:"deny"}')"
+            else
+              # Default: any zero-data-retention, non-training host (fails closed).
+              prov='{"zdr":true,"data_collection":"deny"}'
+            fi
+            req="$(jq -n --arg m "$OMODEL" --arg p "$PROMPT" --argjson prov "$prov" '{model:$m, messages:[{role:"user", content:$p}], provider:$prov}')"
             resp="$(curl -sS -m 180 "${OBASE%/}/chat/completions" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H 'Content-Type: application/json' -H 'HTTP-Referer: https://github.com' -H 'X-Title: PR Review' -d "$req" || true)"
             text="$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty')"
             err="$(printf '%s' "$resp" | jq -r '.error.message // empty')"
