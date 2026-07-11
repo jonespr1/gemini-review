@@ -1,28 +1,35 @@
-# Reusable AI PR-review workflow (self-contained, model-agnostic).
+# Reusable AI PR-review workflow (self-contained, model-agnostic, per-repo provider).
 #
-# Fetches the PR diff, sends it to an AI model in ONE call, and posts the review as
-# a PR comment. No GitHub MCP server, no code-review extension, no agentic tool-loop
-# — so it can't break the way the official run-gemini-cli flow currently does.
+# Fetches the PR diff + prior review conversation, sends it to an AI model in ONE call,
+# and posts the review as a PR comment. No MCP server / no agentic tool-loop.
 #
-# DEFAULT: Google Gemini (gemini-2.5-flash), using the GEMINI_API_KEY secret.
+# PROVIDER PER REPO (set as repo Variables on the target repo):
+#   AI_PROVIDER = gemini (default) | openai
+#   For openai (e.g. GLM 5.2 via OpenRouter):
+#     AI_MODEL    = z-ai/glm-5.2
+#     AI_BASE_URL = https://openrouter.ai/api/v1
+#   Optional: GEMINI_MODEL (default gemini-flash-latest), AI_DUAL=true (always run both).
 #
-# To use an OpenAI-compatible provider instead (e.g. GLM 5.2 via Telnyx), set these
-# repository Variables on the target repo (Settings -> Secrets and variables -> Actions
-# -> Variables) and store that provider's key as the GEMINI_API_KEY secret:
-#   AI_PROVIDER = openai
-#   AI_MODEL    = <provider model id, e.g. glm-5.2>
-#   AI_BASE_URL = <OpenAI-compatible base, e.g. https://api.telnyx.com/v2/ai>
+# KEYS (repo Secrets; the stub passes them with `secrets: inherit`):
+#   GEMINI_API_KEY      — for the Gemini path
+#   OPENROUTER_API_KEY  — for the OpenRouter/GLM path
 #
-# Optional per-repo tuning:
-#   AI_MODEL variable overrides the model for either provider.
-#   A .gemini/styleguide.md file in the repo is injected into the review prompt.
+# DUAL REVIEW: set repo Variable AI_DUAL=true, or comment `@gemini-cli /review-both`
+# on a PR, to run BOTH models and post both reviews (broader coverage for critical PRs).
+#
+# PRIVACY: OpenRouter requests pin `{"zdr": true, "data_collection": "deny"}` so GLM runs
+# only on zero-data-retention, non-training hosts (fails closed if none are available).
 name: 'AI PR Review (reusable)'
 
 on:
   workflow_call:
+    # Declared optional so both the new (secrets: inherit) stubs and any older
+    # explicit-secret stubs work against this workflow without a rollout gap.
     secrets:
       GEMINI_API_KEY:
-        required: true
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
 
 concurrency:
   group: 'ai-review-${{ github.event.pull_request.number || github.event.issue.number }}'
@@ -31,10 +38,10 @@ concurrency:
 jobs:
   review:
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 8
+    timeout-minutes: 10
     permissions:
       contents: 'read'
-      issues: 'read'          # read prior PR comment thread for re-review context
+      issues: 'read'
       pull-requests: 'write'
     steps:
       - name: 'Checkout (for optional .gemini/styleguide.md)'
@@ -46,52 +53,47 @@ jobs:
         shell: 'bash'
         env:
           GH_TOKEN: '${{ github.token }}'
-          AI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          OPENROUTER_API_KEY: '${{ secrets.OPENROUTER_API_KEY }}'
           AI_PROVIDER: '${{ vars.AI_PROVIDER }}'
           AI_MODEL: '${{ vars.AI_MODEL }}'
+          GEMINI_MODEL: '${{ vars.GEMINI_MODEL }}'
           AI_BASE_URL: '${{ vars.AI_BASE_URL }}'
+          AI_DUAL: '${{ vars.AI_DUAL }}'
+          COMMENT_BODY: '${{ github.event.comment.body }}'
           REPO: '${{ github.repository }}'
           PR_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
         run: |
           set -euo pipefail
 
-          PROVIDER="${AI_PROVIDER:-gemini}"
-          if [ "$PROVIDER" = "gemini" ]; then
-            MODEL="${AI_MODEL:-gemini-flash-latest}"
-          else
-            MODEL="${AI_MODEL:-glm-5.2}"
-          fi
+          if [ -z "${PR_NUMBER:-}" ]; then echo "No PR number; nothing to review."; exit 0; fi
 
-          if [ -z "${PR_NUMBER:-}" ]; then
-            echo "No PR number in event context; nothing to review."
-            exit 0
-          fi
-          echo "Reviewing PR #${PR_NUMBER} in ${REPO} using ${PROVIDER}/${MODEL}"
+          GMODEL="${GEMINI_MODEL:-gemini-flash-latest}"
+          OMODEL="${AI_MODEL:-z-ai/glm-5.2}"
+          OBASE="${AI_BASE_URL:-https://openrouter.ai/api/v1}"
+          PRIMARY="${AI_PROVIDER:-gemini}"
 
-          # 1) Fetch the unified diff (cap size to keep the request reasonable).
+          # Dual review if AI_DUAL=true, or the trigger comment asked for /review-both.
+          DUAL=false
+          [ "${AI_DUAL:-}" = "true" ] && DUAL=true
+          case "${COMMENT_BODY:-}" in *"/review-both"*) DUAL=true;; esac
+
+          # 1) Diff (truncate on a line boundary so we never send a half hunk).
           DIFF="$(gh pr diff "$PR_NUMBER" --repo "$REPO" || true)"
-          if [ -z "$DIFF" ]; then
-            echo "Empty diff; nothing to review."
-            exit 0
-          fi
+          if [ -z "$DIFF" ]; then echo "Empty diff; nothing to review."; exit 0; fi
           MAX=60000
           TRUNC_NOTE=""
           if [ "${#DIFF}" -gt "$MAX" ]; then
             DIFF="${DIFF:0:$MAX}"
-            TRUNC_NOTE="
-
-          > Note: the diff was long and was truncated; only the first part was reviewed."
+            DIFF="${DIFF%$'\n'*}"
+            TRUNC_NOTE="$(printf '\n\n> Note: the diff was long and was truncated at a line boundary; only the first part was reviewed.')"
           fi
 
           # 2) Optional per-repo style guide.
           STYLE=""
-          if [ -f .gemini/styleguide.md ]; then
-            STYLE="$(cat .gemini/styleguide.md)"
-          fi
+          [ -f .gemini/styleguide.md ] && STYLE="$(cat .gemini/styleguide.md)"
 
-          # 2b) Prior conversation on this PR: our own previous reviews + human/dev replies,
-          #     oldest first. This is what makes re-reviews context-aware (a two-way thread)
-          #     instead of stateless. Other bots (e.g. security scanners) are excluded.
+          # 3) Prior conversation (our reviews + human replies) for context-aware re-reviews.
           HIST_MAX=20000
           HISTORY="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate 2>/dev/null | jq -s -r '
               (add // [])
@@ -100,11 +102,9 @@ jobs:
                     then "### Your previous review:\n" + .body
                     else "### Developer response (" + .user.login + "):\n" + .body end)
               | join("\n\n---\n\n")' 2>/dev/null || true)"
-          if [ "${#HISTORY}" -gt "$HIST_MAX" ]; then
-            HISTORY="${HISTORY: -$HIST_MAX}"
-          fi
+          if [ "${#HISTORY}" -gt "$HIST_MAX" ]; then HISTORY="${HISTORY: -$HIST_MAX}"; fi
 
-          # 3) Build the review prompt (printf keeps this robust against YAML indentation).
+          # 4) Build the prompt.
           INSTRUCTIONS="$(printf '%s\n' \
             'You are a senior software engineer acting as a second reviewer on a GitHub pull request.' \
             'Review the current unified diff and write a concise, high-signal review in GitHub markdown.' \
@@ -117,14 +117,11 @@ jobs:
             '' \
             'Focus on correctness, security, performance, error handling and missing tests.' \
             'Only report real, verifiable issues; do not invent problems. If the diff is trivial or looks good, say so plainly.')"
-
           REREVIEW="$(printf '%s\n' \
-            'If a PRIOR CONVERSATION section appears below, this is a RE-REVIEW of an evolving PR. Treat it as a continuing two-way conversation, not a fresh review:' \
-            '- Begin with a "## 🔄 Since last review" section listing three groups: ✅ Resolved (issues now fixed in the current diff), 🤝 Acknowledged (the developer gave a sound reason not to change something and you agree — state that you accept it), and ⚠️ Still open.' \
-            '- Do NOT repeat resolved or acknowledged items under Findings. Only include genuinely new or still-unresolved issues there.' \
-            '- If you disagree with a developer response, keep the item open under Findings and briefly explain why you are not yet satisfied.' \
-            '- Respond directly to the developer'\''s points so the thread reads as a conversation. Be willing to change your mind when the reasoning is sound.')"
-
+            'If a PRIOR CONVERSATION section appears below, this is a RE-REVIEW. Treat it as a continuing two-way conversation:' \
+            '- Begin with a "## 🔄 Since last review" section: ✅ Resolved (now fixed), 🤝 Acknowledged (the developer gave a sound reason not to change something and you agree — do not raise it again), ⚠️ Still open.' \
+            '- Do NOT repeat resolved or acknowledged items under Findings; only include new or still-unresolved issues.' \
+            '- If you disagree with a developer response, keep it open and briefly explain why. Change your mind when the reasoning is sound.')"
           PROMPT="${INSTRUCTIONS}
 
           ${REREVIEW}"
@@ -145,29 +142,41 @@ jobs:
           Current unified diff to review:
           ${DIFF}"
 
-          # 4) Call the model API (single request).
-          if [ "$PROVIDER" = "gemini" ]; then
-            REQ="$(jq -n --arg p "$PROMPT" '{contents:[{parts:[{text:$p}]}]}')"
-            RESP="$(curl -sS -m 180 \
-              "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${AI_API_KEY}" \
-              -H 'Content-Type: application/json' -d "$REQ" || true)"
-            REVIEW="$(printf '%s' "$RESP" | jq -r '.candidates[0].content.parts[0].text // empty')"
-            ERR="$(printf '%s' "$RESP" | jq -r '.error.message // empty')"
+          # 5) Model callers. Each echoes the review text.
+          call_gemini() {
+            local req resp text err
+            req="$(jq -n --arg p "$PROMPT" '{contents:[{parts:[{text:$p}]}]}')"
+            resp="$(curl -sS -m 180 "https://generativelanguage.googleapis.com/v1beta/models/${GMODEL}:generateContent?key=${GEMINI_API_KEY}" -H 'Content-Type: application/json' -d "$req" || true)"
+            text="$(printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text // empty')"
+            err="$(printf '%s' "$resp" | jq -r '.error.message // empty')"
+            [ -z "$text" ] && text="$(printf '⚠️ Could not generate review.\n\n```\n%s\n```' "${err:-no response}")"
+            printf '%s' "$text"
+          }
+          call_openai() {
+            local req resp text err
+            req="$(jq -n --arg m "$OMODEL" --arg p "$PROMPT" '{model:$m, messages:[{role:"user", content:$p}], provider:{zdr:true, data_collection:"deny"}}')"
+            resp="$(curl -sS -m 180 "${OBASE%/}/chat/completions" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H 'Content-Type: application/json' -H 'HTTP-Referer: https://github.com' -H 'X-Title: PR Review' -d "$req" || true)"
+            text="$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty')"
+            err="$(printf '%s' "$resp" | jq -r '.error.message // empty')"
+            [ -z "$text" ] && text="$(printf '⚠️ Could not generate review.\n\n```\n%s\n```' "${err:-no response}")"
+            printf '%s' "$text"
+          }
+          post_review() {
+            local body
+            body="$(printf '## 🤖 AI Code Review — `%s`\n\n%s%s\n\n<sub>Automated review — not a substitute for human review.</sub>' "$1" "$2" "$TRUNC_NOTE")"
+            printf '%s' "$body" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
+          }
+
+          # 6) Run the configured model(s).
+          if [ "$DUAL" = "true" ]; then
+            echo "Dual review: Gemini + GLM"
+            post_review "$GMODEL" "$(call_gemini)"
+            post_review "$OMODEL (OpenRouter)" "$(call_openai)"
+          elif [ "$PRIMARY" = "openai" ] || [ "$PRIMARY" = "glm" ]; then
+            echo "Single review: $OMODEL via ${OBASE}"
+            post_review "$OMODEL (OpenRouter)" "$(call_openai)"
           else
-            BASE="${AI_BASE_URL:-https://api.telnyx.com/v2/ai}"
-            REQ="$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, messages:[{role:"user", content:$p}]}')"
-            RESP="$(curl -sS -m 180 "${BASE%/}/chat/completions" \
-              -H "Authorization: Bearer ${AI_API_KEY}" \
-              -H 'Content-Type: application/json' -d "$REQ" || true)"
-            REVIEW="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty')"
-            ERR="$(printf '%s' "$RESP" | jq -r '.error.message // empty')"
+            echo "Single review: $GMODEL"
+            post_review "$GMODEL" "$(call_gemini)"
           fi
-
-          # 5) Compose and post the comment.
-          if [ -z "$REVIEW" ]; then
-            REVIEW="$(printf '%s\n' '⚠️ The AI review could not be generated.' '' '```' "${ERR:-No response text returned by the model.}" '```')"
-          fi
-          BODY="$(printf '## 🤖 AI Code Review — `%s`\n\n%s%s\n\n<sub>Automated review — not a substitute for human review.</sub>' "$MODEL" "$REVIEW" "$TRUNC_NOTE")"
-
-          printf '%s' "$BODY" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
-          echo "Posted AI review to PR #${PR_NUMBER}."
+          echo "Done."
