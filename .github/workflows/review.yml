@@ -56,7 +56,7 @@ jobs:
 
           PROVIDER="${AI_PROVIDER:-gemini}"
           if [ "$PROVIDER" = "gemini" ]; then
-            MODEL="${AI_MODEL:-gemini-2.5-flash}"
+            MODEL="${AI_MODEL:-gemini-flash-latest}"
           else
             MODEL="${AI_MODEL:-glm-5.2}"
           fi
@@ -136,7 +136,7 @@ jobs:
           if [ -z "$REVIEW" ]; then
             REVIEW="$(printf '%s\n' '⚠️ The AI review could not be generated.' '' '```' "${ERR:-No response text returned by the model.}" '```')"
           fi
-          BODY="$(printf '## 🤖 AI Code Review — \`%s\`\n\n%s%s\n\n<sub>Automated review — not a substitute for human review.</sub>' "$MODEL" "$REVIEW" "$TRUNC_NOTE")"
+          BODY="$(printf '## 🤖 AI Code Review — `%s`\n\n%s%s\n\n<sub>Automated review — not a substitute for human review.</sub>' "$MODEL" "$REVIEW" "$TRUNC_NOTE")"
 
           printf '%s' "$BODY" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
           echo "Posted AI review to PR #${PR_NUMBER}."
