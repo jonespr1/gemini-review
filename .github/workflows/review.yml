@@ -50,10 +50,11 @@ jobs:
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
-          gemini_debug: 'true'   # TEMP: verbose logs to diagnose no-review-posted
-          # To pin a model for ALL repos, uncomment and set one value, e.g.
-          #   gemini_model: 'gemini-2.5-pro'   # strongest reviews
-          #   gemini_model: 'gemini-2.5-flash' # lighter, conserves free quota
+          gemini_debug: 'true'   # TEMP: verbose logs while we confirm reviews post
+          # Pin the model. If left to auto-routing the CLI may pick gemini-3.5-flash,
+          # whose free-tier daily limit is only ~20 requests and gets exhausted fast.
+          # gemini-2.5-flash has a much larger free-tier quota and is a separate bucket.
+          gemini_model: 'gemini-2.5-flash'
           github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
           settings: |-
             {
