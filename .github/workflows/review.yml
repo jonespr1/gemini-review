@@ -48,15 +48,17 @@ jobs:
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
           GITHUB_TOKEN: '${{ github.token }}'
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          # FIX 1: the code-review extension's /pr-code-review command reads these from the
+          # ENVIRONMENT (see the extension's GEMINI.md), not from .gemini/context.json.
+          # Without them the model has no repo/PR to review and stalls with 0 tool calls.
+          REPOSITORY: '${{ github.repository }}'
+          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          ADDITIONAL_CONTEXT: ''
         with:
           gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
           gemini_debug: 'true'   # TEMP: verbose logs while we confirm reviews post
-          # Use a Pro model: this review flow is agentic (activate skill -> read PR via
-          # the GitHub MCP server -> post review). Flash (the router forces gemini-3.5-flash)
-          # narrates its plan but never emits the tool calls, so nothing gets posted.
-          # Pro models reliably execute the multi-step tool calls. ~20-30c per review.
-          # 'gemini-pro-latest' is an alias to the current Pro model, so it won't 404
-          # when a specific version retires (as gemini-2.5-pro did for new users).
+          # 'gemini-pro-latest' is an alias to the current Pro model, so it won't 404 when a
+          # specific version retires (as gemini-2.5-pro did for new users). ~20-30c per review.
           gemini_model: 'gemini-pro-latest'
           github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
           settings: |-
@@ -71,9 +73,10 @@ jobs:
                     "ghcr.io/github/github-mcp-server:v0.27.0"
                   ],
                   "includeTools": [
-                    "add_comment_to_pending_review",
                     "pull_request_read",
-                    "pull_request_review_write"
+                    "create_pending_pull_request_review",
+                    "add_comment_to_pending_review",
+                    "submit_pending_pull_request_review"
                   ],
                   "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
                 }
