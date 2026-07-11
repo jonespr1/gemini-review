@@ -1,8 +1,22 @@
-# Reusable Gemini pull-request review workflow.
-# Lives in the central repo (jonespr1/gemini-review) and is called by a tiny
-# stub workflow in each target repo. Update this file to improve reviews
-# everywhere at once. Contains NO secrets, so this repo can be public.
-name: 'Gemini PR Review (reusable)'
+# Reusable AI PR-review workflow (self-contained, model-agnostic).
+#
+# Fetches the PR diff, sends it to an AI model in ONE call, and posts the review as
+# a PR comment. No GitHub MCP server, no code-review extension, no agentic tool-loop
+# — so it can't break the way the official run-gemini-cli flow currently does.
+#
+# DEFAULT: Google Gemini (gemini-2.5-flash), using the GEMINI_API_KEY secret.
+#
+# To use an OpenAI-compatible provider instead (e.g. GLM 5.2 via Telnyx), set these
+# repository Variables on the target repo (Settings -> Secrets and variables -> Actions
+# -> Variables) and store that provider's key as the GEMINI_API_KEY secret:
+#   AI_PROVIDER = openai
+#   AI_MODEL    = <provider model id, e.g. glm-5.2>
+#   AI_BASE_URL = <OpenAI-compatible base, e.g. https://api.telnyx.com/v2/ai>
+#
+# Optional per-repo tuning:
+#   AI_MODEL variable overrides the model for either provider.
+#   A .gemini/styleguide.md file in the repo is injected into the review prompt.
+name: 'AI PR Review (reusable)'
 
 on:
   workflow_call:
@@ -11,80 +25,118 @@ on:
         required: true
 
 concurrency:
-  group: 'gemini-review-${{ github.event.pull_request.number || github.event.issue.number }}'
+  group: 'ai-review-${{ github.event.pull_request.number || github.event.issue.number }}'
   cancel-in-progress: true
 
 jobs:
   review:
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 10
+    timeout-minutes: 8
     permissions:
       contents: 'read'
-      issues: 'write'
       pull-requests: 'write'
     steps:
-      - name: 'Checkout repository'
+      - name: 'Checkout (for optional .gemini/styleguide.md)'
         uses: 'actions/checkout@v4'
         with:
           persist-credentials: 'false'
 
-      # The /pr-code-review command needs the repo + PR number as context. Without
-      # this file the CLI runs but silently posts nothing (run-gemini-cli issue #265).
-      - name: 'Prepare prompt context'
+      - name: 'AI review'
         shell: 'bash'
         env:
-          REPOSITORY: '${{ github.repository }}'
-          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
-        run: |-
-          mkdir -p .gemini
-          jq -n \
-            --arg repo "${REPOSITORY}" \
-            --arg pr "${PULL_REQUEST_NUMBER}" \
-            '{repository: $repo, pull_request_number: $pr}' > .gemini/context.json
+          GH_TOKEN: '${{ github.token }}'
+          AI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          AI_PROVIDER: '${{ vars.AI_PROVIDER }}'
+          AI_MODEL: '${{ vars.AI_MODEL }}'
+          AI_BASE_URL: '${{ vars.AI_BASE_URL }}'
+          REPO: '${{ github.repository }}'
+          PR_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
+        run: |
+          set -euo pipefail
 
-      - name: 'Run Gemini pull request review'
-        uses: 'google-github-actions/run-gemini-cli@v0'
-        env:
-          GEMINI_CLI_TRUST_WORKSPACE: 'true'
-          GITHUB_TOKEN: '${{ github.token }}'
-          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
-          # FIX 1: the code-review extension's /pr-code-review command reads these from the
-          # ENVIRONMENT (see the extension's GEMINI.md), not from .gemini/context.json.
-          # Without them the model has no repo/PR to review and stalls with 0 tool calls.
-          REPOSITORY: '${{ github.repository }}'
-          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
-          ADDITIONAL_CONTEXT: ''
-        with:
-          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
-          gemini_debug: 'true'   # TEMP: verbose logs while we confirm reviews post
-          # 'gemini-pro-latest' is an alias to the current Pro model, so it won't 404 when a
-          # specific version retires (as gemini-2.5-pro did for new users). ~20-30c per review.
-          gemini_model: 'gemini-pro-latest'
-          github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
-          settings: |-
-            {
-              "model": { "maxSessionTurns": 25 },
-              "mcpServers": {
-                "github": {
-                  "command": "docker",
-                  "args": [
-                    "run", "-i", "--rm",
-                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-                    "ghcr.io/github/github-mcp-server:v0.27.0"
-                  ],
-                  "includeTools": [
-                    "add_comment_to_pending_review",
-                    "create_pending_pull_request_review",
-                    "pull_request_read",
-                    "pull_request_review_write"
-                  ],
-                  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
-                }
-              },
-              "tools": { "core": [] }
-            }
-          extensions: |
-            [
-              "https://github.com/gemini-cli-extensions/code-review"
-            ]
-          prompt: '/pr-code-review'
+          PROVIDER="${AI_PROVIDER:-gemini}"
+          if [ "$PROVIDER" = "gemini" ]; then
+            MODEL="${AI_MODEL:-gemini-2.5-flash}"
+          else
+            MODEL="${AI_MODEL:-glm-5.2}"
+          fi
+
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "No PR number in event context; nothing to review."
+            exit 0
+          fi
+          echo "Reviewing PR #${PR_NUMBER} in ${REPO} using ${PROVIDER}/${MODEL}"
+
+          # 1) Fetch the unified diff (cap size to keep the request reasonable).
+          DIFF="$(gh pr diff "$PR_NUMBER" --repo "$REPO" || true)"
+          if [ -z "$DIFF" ]; then
+            echo "Empty diff; nothing to review."
+            exit 0
+          fi
+          MAX=60000
+          TRUNC_NOTE=""
+          if [ "${#DIFF}" -gt "$MAX" ]; then
+            DIFF="${DIFF:0:$MAX}"
+            TRUNC_NOTE="
+
+          > Note: the diff was long and was truncated; only the first part was reviewed."
+          fi
+
+          # 2) Optional per-repo style guide.
+          STYLE=""
+          if [ -f .gemini/styleguide.md ]; then
+            STYLE="$(cat .gemini/styleguide.md)"
+          fi
+
+          # 3) Build the review prompt (printf keeps this robust against YAML indentation).
+          INSTRUCTIONS="$(printf '%s\n' \
+            'You are a senior software engineer acting as a second reviewer on a GitHub pull request.' \
+            'Review the unified diff below and write a concise, high-signal review in GitHub markdown.' \
+            '' \
+            'Use exactly these sections (omit a severity bucket if it has no items):' \
+            '## 📋 Summary — 2-3 sentences on what the PR does and its overall quality.' \
+            '## 🔍 Findings — bullets grouped as 🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Low.' \
+            '  For each finding cite the file and approximate line, and give a specific, actionable fix.' \
+            '## ✅ Positives — briefly note anything done well.' \
+            '' \
+            'Focus on correctness, security, performance, error handling and missing tests.' \
+            'Only report real, verifiable issues; do not invent problems. If the diff is trivial or looks good, say so plainly.')"
+
+          PROMPT="$INSTRUCTIONS"
+          if [ -n "$STYLE" ]; then
+            PROMPT="${PROMPT}
+
+          Team style guide to enforce:
+          ${STYLE}"
+          fi
+          PROMPT="${PROMPT}
+
+          Unified diff to review:
+          ${DIFF}"
+
+          # 4) Call the model API (single request).
+          if [ "$PROVIDER" = "gemini" ]; then
+            REQ="$(jq -n --arg p "$PROMPT" '{contents:[{parts:[{text:$p}]}]}')"
+            RESP="$(curl -sS -m 180 \
+              "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${AI_API_KEY}" \
+              -H 'Content-Type: application/json' -d "$REQ" || true)"
+            REVIEW="$(printf '%s' "$RESP" | jq -r '.candidates[0].content.parts[0].text // empty')"
+            ERR="$(printf '%s' "$RESP" | jq -r '.error.message // empty')"
+          else
+            BASE="${AI_BASE_URL:-https://api.telnyx.com/v2/ai}"
+            REQ="$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, messages:[{role:"user", content:$p}]}')"
+            RESP="$(curl -sS -m 180 "${BASE%/}/chat/completions" \
+              -H "Authorization: Bearer ${AI_API_KEY}" \
+              -H 'Content-Type: application/json' -d "$REQ" || true)"
+            REVIEW="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty')"
+            ERR="$(printf '%s' "$RESP" | jq -r '.error.message // empty')"
+          fi
+
+          # 5) Compose and post the comment.
+          if [ -z "$REVIEW" ]; then
+            REVIEW="$(printf '%s\n' '⚠️ The AI review could not be generated.' '' '```' "${ERR:-No response text returned by the model.}" '```')"
+          fi
+          BODY="$(printf '## 🤖 AI Code Review — \`%s\`\n\n%s%s\n\n<sub>Automated review — not a substitute for human review.</sub>' "$MODEL" "$REVIEW" "$TRUNC_NOTE")"
+
+          printf '%s' "$BODY" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
+          echo "Posted AI review to PR #${PR_NUMBER}."
