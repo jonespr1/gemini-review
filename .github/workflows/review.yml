@@ -34,6 +34,7 @@ jobs:
     timeout-minutes: 8
     permissions:
       contents: 'read'
+      issues: 'read'          # read prior PR comment thread for re-review context
       pull-requests: 'write'
     steps:
       - name: 'Checkout (for optional .gemini/styleguide.md)'
@@ -88,12 +89,27 @@ jobs:
             STYLE="$(cat .gemini/styleguide.md)"
           fi
 
+          # 2b) Prior conversation on this PR: our own previous reviews + human/dev replies,
+          #     oldest first. This is what makes re-reviews context-aware (a two-way thread)
+          #     instead of stateless. Other bots (e.g. security scanners) are excluded.
+          HIST_MAX=20000
+          HISTORY="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate 2>/dev/null | jq -s -r '
+              (add // [])
+              | map(select((.body | startswith("## 🤖 AI Code Review")) or (.user.type == "User")))
+              | map(if (.body | startswith("## 🤖 AI Code Review"))
+                    then "### Your previous review:\n" + .body
+                    else "### Developer response (" + .user.login + "):\n" + .body end)
+              | join("\n\n---\n\n")' 2>/dev/null || true)"
+          if [ "${#HISTORY}" -gt "$HIST_MAX" ]; then
+            HISTORY="${HISTORY: -$HIST_MAX}"
+          fi
+
           # 3) Build the review prompt (printf keeps this robust against YAML indentation).
           INSTRUCTIONS="$(printf '%s\n' \
             'You are a senior software engineer acting as a second reviewer on a GitHub pull request.' \
-            'Review the unified diff below and write a concise, high-signal review in GitHub markdown.' \
+            'Review the current unified diff and write a concise, high-signal review in GitHub markdown.' \
             '' \
-            'Use exactly these sections (omit a severity bucket if it has no items):' \
+            'Use these sections (omit a severity bucket if it has no items):' \
             '## 📋 Summary — 2-3 sentences on what the PR does and its overall quality.' \
             '## 🔍 Findings — bullets grouped as 🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Low.' \
             '  For each finding cite the file and approximate line, and give a specific, actionable fix.' \
@@ -102,16 +118,31 @@ jobs:
             'Focus on correctness, security, performance, error handling and missing tests.' \
             'Only report real, verifiable issues; do not invent problems. If the diff is trivial or looks good, say so plainly.')"
 
-          PROMPT="$INSTRUCTIONS"
+          REREVIEW="$(printf '%s\n' \
+            'If a PRIOR CONVERSATION section appears below, this is a RE-REVIEW of an evolving PR. Treat it as a continuing two-way conversation, not a fresh review:' \
+            '- Begin with a "## 🔄 Since last review" section listing three groups: ✅ Resolved (issues now fixed in the current diff), 🤝 Acknowledged (the developer gave a sound reason not to change something and you agree — state that you accept it), and ⚠️ Still open.' \
+            '- Do NOT repeat resolved or acknowledged items under Findings. Only include genuinely new or still-unresolved issues there.' \
+            '- If you disagree with a developer response, keep the item open under Findings and briefly explain why you are not yet satisfied.' \
+            '- Respond directly to the developer'\''s points so the thread reads as a conversation. Be willing to change your mind when the reasoning is sound.')"
+
+          PROMPT="${INSTRUCTIONS}
+
+          ${REREVIEW}"
           if [ -n "$STYLE" ]; then
             PROMPT="${PROMPT}
 
           Team style guide to enforce:
           ${STYLE}"
           fi
+          if [ -n "$HISTORY" ]; then
+            PROMPT="${PROMPT}
+
+          PRIOR CONVERSATION (your earlier reviews and the developer's responses, oldest first):
+          ${HISTORY}"
+          fi
           PROMPT="${PROMPT}
 
-          Unified diff to review:
+          Current unified diff to review:
           ${DIFF}"
 
           # 4) Call the model API (single request).
